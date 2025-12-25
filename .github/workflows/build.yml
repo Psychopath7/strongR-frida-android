@@ -3,7 +3,7 @@ name: strongR-frida
 on:
   schedule:
     - cron: "0 9/12 * * *"
-  workflow_dispatch:
+  workflow_dispatch: # 수동 실행
 
 permissions:
   contents: write
@@ -36,27 +36,29 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             
+            // 수동 실행(workflow_dispatch)이면 무조건 빌드 진행하도록 설정
+            if (context.eventName === 'workflow_dispatch') {
+              console.log('Manual run detected. Forcing build.');
+              core.setOutput('ALREADY_RELEASE', '0');
+              return;
+            }
+
             try {
               const releaseResponse = await github.rest.repos.getReleaseByTag({
                 owner: owner,
                 repo: repo,
                 tag: fridaVersion
               });
-              // 릴리즈가 이미 존재함
               core.setOutput('ALREADY_RELEASE', '1');
             } catch (e) {
-              if (e.status === 404) {
-                // 릴리즈가 없음 (빌드 진행)
-                core.setOutput('ALREADY_RELEASE', '0');
-              } else {
-                core.setFailed(e.message);
-              }
+              core.setOutput('ALREADY_RELEASE', '0');
             }
 
   android_build:
     runs-on: ubuntu-22.04
     needs: check_version
-    if: needs.check_version.outputs.ALREADY_RELEASE == '0'
+    # 조건: 릴리즈가 없거나(0) OR 수동 실행이면 무조건 실행
+    if: needs.check_version.outputs.ALREADY_RELEASE == '0' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
 
@@ -89,38 +91,30 @@ jobs:
       - name: build frida for Android
         shell: bash
         run: |
-          # Git 설정 (빌드용 더미 설정)
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@github.com"
           
-          # 환경 변수 설정
           export ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}
           
-          # Frida 원본 클론
           git clone --recurse-submodules https://github.com/frida/frida
           
           cd frida
           
-          # 패치 적용 (현재 레포지토리의 Patchs 폴더 사용)
-          # 체크아웃한 위치가 workspace 루트이므로 ../Patchs로 접근
           for path in ../Patchs/strongR-frida/*
           do
             name=$(basename $path)
             real=$(realpath $path)
-            echo "Apply patches in $real to frida/subprojects/$name"
-            
-            # 해당 서브 프로젝트가 존재하는지 확인
             if [ -d "subprojects/$name" ]; then
                 cd subprojects/$name
                 git am ../../../Patchs/strongR-frida/$name/*.patch
                 cd ../..
-            else
-                echo "Skipping $name (directory not found)"
             fi
           done
           
-          # 아키텍처별 빌드
-          ARCHES="android-arm android-arm64 android-x86 android-x86_64"
+          # 시간 절약을 위해 arm64만 먼저 빌드 (필요하면 다른 아키텍처 추가)
+          # ARCHES="android-arm android-arm64 android-x86 android-x86_64"
+          ARCHES="android-arm64" 
+          
           for ARCH in $ARCHES
           do
             echo "Building for $ARCH..."
@@ -133,22 +127,16 @@ jobs:
 
       - name: package build result
         run: |
-          # 파일 압축 (xz 사용 권장하지만 기존 호환성을 위해 gzip 사용하거나 그대로 둠)
-          # 여기서는 원본 스크립트처럼 gzip 사용
-          
-          for ARCH in android-arm android-arm64 android-x86 android-x86_64
+          # 빌드된 파일만 압축
+          ARCHES="android-arm64"
+          for ARCH in $ARCHES
           do
-            # Server
             if [ -f "build-$ARCH/subprojects/frida-core/server/frida-server" ]; then
               gzip -c "build-$ARCH/subprojects/frida-core/server/frida-server" > "hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-$ARCH.gz"
             fi
-            
-            # Inject
             if [ -f "build-$ARCH/subprojects/frida-core/inject/frida-inject" ]; then
               gzip -c "build-$ARCH/subprojects/frida-core/inject/frida-inject" > "hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-$ARCH.gz"
             fi
-            
-            # Gadget
             if [ -f "build-$ARCH/subprojects/frida-core/lib/gadget/frida-gadget.so" ]; then
               gzip -c "build-$ARCH/subprojects/frida-core/lib/gadget/frida-gadget.so" > "hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-$ARCH.so.gz"
             fi
@@ -160,8 +148,7 @@ jobs:
           tag_name: ${{ needs.check_version.outputs.FRIDA_VERSION }}
           name: ${{ needs.check_version.outputs.FRIDA_VERSION }}
           files: |
-            hluda-server-*.gz
-            hluda-inject-*.gz
-            hluda-gadget-*.so.gz
+            hluda-*.gz
+            hluda-*.so.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
